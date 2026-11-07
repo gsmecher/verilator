@@ -138,6 +138,14 @@ private:
     std::size_t trimElementBitRange(int elem, int bitLsb, int bitMsb) {
         auto it = std::lower_bound(m_entries.begin(), m_entries.end(), elem,
                                    [](const Entry& e, int idx) { return e.m_msb < idx; });
+        // Split a whole-element entry covering a range of elements around 'elem', so its bit
+        // entries can follow its own entry and keep m_entries sorted by m_msb
+        if (it != m_entries.end() && it->m_lsb <= elem && it->m_lsb != it->m_msb
+            && it->m_elemWidth == 0) {
+            const Entry range = *it;
+            it = m_entries.insert(trimEntries(elem, elem),
+                                  {elem, elem, range.m_rhsLsb, range.m_rhsDatap});
+        }
         while (it != m_entries.end() && it->m_lsb <= elem) {
             if (it->m_elemWidth == 0 || it->m_bitMsb < bitLsb || it->m_bitLsb > bitMsb) {
                 ++it;
