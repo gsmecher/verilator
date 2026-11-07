@@ -329,6 +329,22 @@ public:
         return n;
     }
 
+    // Whether a struct or union, at any depth in this type, has an unpacked array member
+    static bool hasUnpackedArrayMember(const AstNodeDType* dtypep) {
+        dtypep = dtypep->skipRefp();
+        if (const AstUnpackArrayDType* const arrayp = VN_CAST(dtypep, UnpackArrayDType)) {
+            return hasUnpackedArrayMember(arrayp->subDTypep());
+        }
+        if (const AstNodeUOrStructDType* const sp = VN_CAST(dtypep, NodeUOrStructDType)) {
+            for (const AstMemberDType* memberp = sp->membersp(); memberp;
+                 memberp = VN_AS(memberp->nextp(), MemberDType)) {
+                const AstNodeDType* const subp = memberp->subDTypep()->skipRefp();
+                if (VN_IS(subp, UnpackArrayDType) || hasUnpackedArrayMember(subp)) return true;
+            }
+        }
+        return false;
+    }
+
     // The range [lo, hi] of flattened elements that a path into an unpacked array selects:
     // all of it for a VarRef, else what its constant ArraySels pick, numbered as
     // flattenIndex() numbers an element for readers: an unpacked array member of a struct
@@ -390,6 +406,15 @@ public:
             int lo = 0;
             int hi = 0;
             elemRangeOfPath(lhsp, lo, hi);
+            if (isUnpackedArrayDType(lhsp->dtypep()) && hasUnpackedArrayMember(varp->dtypep())) {
+                // A struct element and an element of an array within it are numbered alike, so
+                // a range of either kind would cover the other
+                lhsp->v3warn(E_UNSUPPORTED,
+                             "Unsupported: force/release of more than one element of an unpacked "
+                             "array of structs or unions with unpacked array members");
+                info.m_unsupported = true;
+                return info;
+            }
             info.m_rangeLsb = lo;
             info.m_rangeMsb = hi;
             info.m_inForceVecOnly = true;
