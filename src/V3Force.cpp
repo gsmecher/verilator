@@ -54,7 +54,7 @@ public:
     struct ForceInfo final : ForceRange {
         // MEMBERS
         int m_forceId = 0;  // Unique (per signal) variable of this force assignment
-        bool m_hasArraySel = false;  // If this has an array select on LHS
+        bool m_inForceVecOnly = false;  // See ForceRangeInfo::m_inForceVecOnly
         bool m_isExternal = false;  // Synthetic force for the public force controls
         bool m_skipRdRefresh = false;  // finalizeRhsVars's force-rd-update block refreshes forceRd
         AstVarScope* m_rhsVarVscp = nullptr;  // Scope of the var containing RHSID
@@ -62,9 +62,9 @@ public:
 
         ForceInfo() = default;
         ForceInfo(int rangeLsb, int rangeMsb, int padLsb, int padMsb, int forceId,
-                  bool hasArraySel, AstVarScope* rhsVarVscp, AstNodeExpr* rhsExprp)
+                  bool inForceVecOnly, AstVarScope* rhsVarVscp, AstNodeExpr* rhsExprp)
             : m_forceId{forceId}
-            , m_hasArraySel{hasArraySel}
+            , m_inForceVecOnly{inForceVecOnly}
             , m_rhsVarVscp{rhsVarVscp}
             , m_rhsExprp{rhsExprp} {
             m_rangeLsb = rangeLsb;
@@ -136,8 +136,10 @@ public:
     };
 
     struct ForceRangeInfo final : ForceRange {
-        bool m_hasArraySel = false;  // LHS has an array select
-        ArraySelInfo m_arrayInfo;  // Array-select information collected for the LHS
+        // The range is of the flattened elements of an unpacked array, tracked only in
+        // VlForceVec (no external force enable/value, no synthetic path index)
+        bool m_inForceVecOnly = false;
+        bool m_unsupported = false;  // Reported unsupported: no force is made of it
     };
 
 private:
@@ -166,6 +168,7 @@ private:
     std::unordered_map<AstScope*, ScopeVarCache> m_scopeVarCaches;
     bool m_doingAssign = false;  // If true, we're processing procedural continuous assign
                                  // statements instead of force statements
+    std::unordered_set<const AstAssignForce*> m_unsupportedForces;  // Reported unsupported
     ProtectedVarRefSet& m_permanentlyProtected;
     BuiltVarScopeSet& m_forceRdUpdateBuilt;
 
@@ -274,6 +277,9 @@ public:
         if (AstSampled* sampledp = VN_CAST(basep, Sampled))
             if (AstNodeExpr* exprp = VN_CAST(sampledp->exprp(), NodeExpr))
                 return getOneVarRef(exprp);
+        // baseFromp() stops at a SliceSel (an unpacked array slice)
+        if (AstSliceSel* const slicep = VN_CAST(basep, SliceSel))
+            return getOneVarRef(slicep->fromp());
         AstVarRef* const varRefp = VN_CAST(basep, VarRef);
         UASSERT_OBJ(varRefp, forceStmtp, "Force/release expression has no VarRef at its base");
         return varRefp;
@@ -312,12 +318,46 @@ public:
         return headp;
     }
 
+    // Number of leaf elements under an unpacked array type (1 for a non-array)
+    static int leafElements(const AstNodeDType* dtypep) {
+        int n = 1;
+        while (const AstUnpackArrayDType* const arrayp
+               = VN_CAST(dtypep->skipRefp(), UnpackArrayDType)) {
+            n *= arrayp->elementsConst();
+            dtypep = arrayp->subDTypep();
+        }
+        return n;
+    }
+
+    // The range [lo, hi] of flattened elements that a path into an unpacked array selects:
+    // all of it for a VarRef, else what its constant ArraySels pick, numbered as
+    // flattenIndex() numbers an element for readers: an unpacked array member of a struct
+    // element extends the flattening like another dimension.  A bit select is within an
+    // element.  V3Width rejected non-constant selects (checkForceReleaseLhs) and V3Const
+    // folded the constant ones.
+    static void elemRangeOfPath(AstNodeExpr* nodep, int& lo, int& hi) {
+        if (VN_IS(nodep, VarRef)) {
+            lo = 0;
+            hi = leafElements(nodep->dtypep()) - 1;
+        } else if (const AstSel* const selp = VN_CAST(nodep, Sel)) {
+            elemRangeOfPath(selp->fromp(), lo, hi);
+        } else if (const AstStructSel* const selp = VN_CAST(nodep, StructSel)) {
+            elemRangeOfPath(selp->fromp(), lo, hi);
+            const int members = leafElements(selp->dtypep());
+            lo *= members;
+            hi = (hi + 1) * members - 1;
+        } else {
+            const AstArraySel* const arraySelp = VN_AS(nodep, ArraySel);
+            elemRangeOfPath(arraySelp->fromp(), lo, hi);
+            const int stride = leafElements(arraySelp->dtypep());
+            lo += VN_AS(arraySelp->bitp(), Const)->toSInt() * stride;
+            hi = lo + stride - 1;
+        }
+    }
+
     ForceRangeInfo getForceRangeInfo(AstNodeExpr* lhsp, AstVar* varp,
                                      bool requireConstRangeSelect) {
         ForceRangeInfo info;
-        info.m_arrayInfo = getArraySelInfo(lhsp);
-        info.m_hasArraySel = !info.m_arrayInfo.m_sels.empty();
-
         info.m_padMsb = isBitwiseDType(varp) ? (varp->width() - 1) : 0;
 
         if (const AstSel* const outerSelp = VN_CAST(lhsp, Sel)) {
@@ -336,24 +376,25 @@ public:
 
         info.m_rangeLsb = info.m_padLsb;
         info.m_rangeMsb = info.m_padMsb;
-        if (info.m_hasArraySel) {
-            // Unpacked array selections are tracked as a single flattened element index
-            // inside VlForceVec, regardless of how many unpacked dimensions the source uses.
-            std::vector<int> indices;
-            indices.reserve(info.m_arrayInfo.m_sels.size());
-            for (AstArraySel* const selp : info.m_arrayInfo.m_sels) {
-                UASSERT_OBJ(VN_IS(selp->bitp(), Const), selp,
-                            "Unsupported: force on non-constant array select");
-                indices.push_back(VN_AS(selp->bitp(), Const)->toSInt());
+        if (isUnpackedArrayDType(varp->dtypep()) || !getArraySelInfo(lhsp).m_sels.empty()) {
+            // Elements of an unpacked array, from all of them to one, are a contiguous range
+            // of its flattened element indices in VlForceVec, which reads each back from the
+            // RHS at the same offset; a bit select is within one element
+            if (lhsp->exists([](const AstSliceSel*) { return true; })) {
+                lhsp->v3warn(E_UNSUPPORTED,
+                             "Unsupported: force/release of a slice of an unpacked array"
+                             " (IEEE 1800-2023 10.6.2)");
+                info.m_unsupported = true;
+                return info;
             }
-            info.m_rangeLsb = flattenIndex(indices, arraySelDimSizes(info.m_arrayInfo));
-
-            info.m_rangeMsb = info.m_rangeLsb;
-        } else if (isUnpackedArrayDType(varp->dtypep())) {
-            lhsp->v3fatalSrc("Whole unpacked-array force/release should have been lowered via "
-                             "element selections");
+            int lo = 0;
+            int hi = 0;
+            elemRangeOfPath(lhsp, lo, hi);
+            info.m_rangeLsb = lo;
+            info.m_rangeMsb = hi;
+            info.m_inForceVecOnly = true;
         }
-        if (!isBitwiseDType(varp) && !info.m_hasArraySel && !VN_IS(lhsp, VarRef)) {
+        if (!isBitwiseDType(varp) && !info.m_inForceVecOnly && !VN_IS(lhsp, VarRef)) {
             // Non-bitwise member/struct paths cannot use a real bit range, so map each distinct
             // source path onto a synthetic index in VlForceVec and use that index consistently
             // for force, release, and readback.
@@ -539,6 +580,11 @@ public:
     bool hasClockedWrite(AstVar* varp) const { return m_clockedWrites.count(varp); }
 
     bool doingAssign() const { return m_doingAssign; }
+    // A force reported unsupported, which the convert pass removes
+    void markUnsupported(const AstAssignForce* nodep) { m_unsupportedForces.insert(nodep); }
+    bool isUnsupported(const AstAssignForce* nodep) const {
+        return m_unsupportedForces.count(nodep) > 0;
+    }
 
     const VarForceInfo* getVarInfo(AstVarScope* vscp) const {
         const auto it = m_varToId.find(vscp);
@@ -557,7 +603,7 @@ public:
     }
     void addForceAssignment(AstVar* varp, AstVarScope* vscp, AstNodeExpr* rhsExprp,
                             AstAssignForce* forceStmtp, int rangeLsb, int rangeMsb, int padLsb,
-                            int padMsb, bool hasArraySel, bool skipRdRefresh = false) {
+                            int padMsb, bool inForceVecOnly, bool skipRdRefresh = false) {
         v3Global.setUsesForce();
         varp->setForcedByCode();
 
@@ -585,7 +631,7 @@ public:
 
         auto pair = info.m_forces.emplace(forceStmtp,
                                           ForceInfo{rangeLsb, rangeMsb, padLsb, padMsb, forceId,
-                                                    hasArraySel, nullptr, rhsExprp});
+                                                    inForceVecOnly, nullptr, rhsExprp});
         ForceInfo& finfo = pair.first->second;
         finfo.m_isExternal = forceStmtp->user2();
         finfo.m_skipRdRefresh = skipRdRefresh;
@@ -968,7 +1014,7 @@ class ForceDiscoveryVisitor final : public VNVisitorConst {
                 m_state.addForceAssignment(varp, nodep, rhsClonep, forceAssignp,
                                            /*rangeLsb=*/flat, /*rangeMsb=*/flat,
                                            /*padLsb=*/0, /*padMsb=*/innerWidth - 1,
-                                           /*hasArraySel=*/true, /*skipRdRefresh=*/true);
+                                           /*inForceVecOnly=*/true, /*skipRdRefresh=*/true);
                 return forceAssignp;
             });
         activep->addProcsp(new AstAlways{flp, VAlwaysKwd::ALWAYS, nullptr, alwaysBodyHeadp});
@@ -986,13 +1032,17 @@ class ForceDiscoveryVisitor final : public VNVisitorConst {
         // Resolve force bookkeeping range/padding for the LHS shape.
         ForceState::ForceRangeInfo rangeInfo
             = m_state.getForceRangeInfo(nodep->lhsp(), forcedVarp, true);
+        if (rangeInfo.m_unsupported) {
+            m_state.markUnsupported(nodep);
+            return;
+        }
 
         // Keep narrow rhs, VlForceVec blends unpacked-array bit-select forces at read time
         AstNodeExpr* const rhsExprp = nodep->rhsp()->cloneTreePure(false);
 
         m_state.addForceAssignment(forcedVarp, lhsVarRefp->varScopep(), rhsExprp, nodep,
                                    rangeInfo.m_rangeLsb, rangeInfo.m_rangeMsb, rangeInfo.m_padLsb,
-                                   rangeInfo.m_padMsb, rangeInfo.m_hasArraySel);
+                                   rangeInfo.m_padMsb, rangeInfo.m_inForceVecOnly);
     }
 
     void visit(AstAssign* nodep) override {
@@ -1105,6 +1155,10 @@ class ForceConvertVisitor final : public VNVisitor {
 
     void visit(AstAssignForce* nodep) override {
         UINFO(2, "Converting force statement: " << nodep << "\n");
+        if (m_state.isUnsupported(nodep)) {
+            VL_DO_DANGLING(pushDeletep(nodep->unlinkFrBack()), nodep);
+            return;
+        }
 
         AstNodeExpr* const lhsp = nodep->lhsp();
         AstVarRef* const lhsVarRefp = m_state.getOneVarRef(lhsp);
@@ -1128,9 +1182,10 @@ class ForceConvertVisitor final : public VNVisitor {
         const bool bitwiseForcedVar = ForceState::isBitwiseDType(forcedVarp);
         // When an externally forceable signal is also forced in (System)Verilog code
         // keep the public __VforceEn/__VforceVal signals in sync with the procedural force too.
-        // Don't do this for array selections; those are represented only in VlForceVec.
+        // Don't do this for array elements, ranges of them or selections within them; those are
+        // represented only in VlForceVec.
         if (!nodep->user2() && varInfop->m_forceEnVscp && varInfop->m_forceValVscp
-            && !info.m_hasArraySel) {
+            && !info.m_inForceVecOnly) {
             AstNodeExpr* baseExprp = nodep->rhsp()->cloneTreePure(false);
             baseExprp->foreach(
                 [](AstVarRef* const refp) { ForceState::markNonReplaceable(refp); });
@@ -1173,8 +1228,7 @@ class ForceConvertVisitor final : public VNVisitor {
         //   forceVec.addForce(range_lsb, range_msb, &forceRHS[id], rhs_lsb);
         const AstSel* const selLhsp = VN_CAST(lhsp, Sel);
         const bool arrayBitSel
-            = info.m_hasArraySel && selLhsp && ForceState::getArraySelInfo(lhsp).m_hasBitSel
-              && ForceState::isBitwiseDType(selLhsp->fromp())
+            = info.m_inForceVecOnly && selLhsp && ForceState::isBitwiseDType(selLhsp->fromp())
               && (info.m_padMsb - info.m_padLsb + 1) < selLhsp->fromp()->width();
         AstNodeExpr* const rhsDatap = ForceState::buildRhsDataExpr(flp, info);
         AstCExpr* const rhsAddrp = new AstCExpr{flp};
@@ -1232,11 +1286,14 @@ class ForceConvertVisitor final : public VNVisitor {
 
         const ForceState::ForceRangeInfo rangeInfo
             = m_state.getForceRangeInfo(lhsp, releasedVarp, false);
+        if (rangeInfo.m_unsupported) {
+            VL_DO_DANGLING(pushDeletep(nodep->unlinkFrBack()), nodep);
+            return;
+        }
 
         const AstSel* const selLhsp = VN_CAST(lhsp, Sel);
         const bool arrayBitSel
-            = rangeInfo.m_hasArraySel && selLhsp && rangeInfo.m_arrayInfo.m_hasBitSel
-              && ForceState::isBitwiseDType(selLhsp->fromp())
+            = rangeInfo.m_inForceVecOnly && selLhsp && ForceState::isBitwiseDType(selLhsp->fromp())
               && (rangeInfo.m_padMsb - rangeInfo.m_padLsb + 1) < selLhsp->fromp()->width();
         AstCMethodHard* const releaseCallp = new AstCMethodHard{
             flp, new AstVarRef{flp, varInfop->m_forceVecVscp, VAccess::WRITE},
@@ -1252,9 +1309,10 @@ class ForceConvertVisitor final : public VNVisitor {
 
         AstAssign* clearEnp = nullptr;
         // Releases must also clear the external/public force-enable, but only for
-        // directly forceable variables and only for non-array-select cases that use that external
-        // force.
-        if (releasedVarp->isForceable() && varInfop->m_forceEnVscp && !rangeInfo.m_hasArraySel) {
+        // directly forceable variables and only for cases that use that external force, not
+        // those represented only in VlForceVec.
+        if (releasedVarp->isForceable() && varInfop->m_forceEnVscp
+            && !rangeInfo.m_inForceVecOnly) {
             AstNodeExpr* const enWritep
                 = new AstVarRef{flp, varInfop->m_forceEnVscp, VAccess::WRITE};
             if (ForceState::isBitwiseDType(releasedVarp)) {
@@ -1288,9 +1346,9 @@ class ForceConvertVisitor final : public VNVisitor {
 
         // IEEE 1800-2023 10.6.2: When released, if the variable is not continuously driven,
         // it maintains its current value until the next procedural assignment.
-        const bool fullBitwiseRelease
-            = ForceState::isBitwiseDType(releasedVarp) && !rangeInfo.m_hasArraySel && !selp
-              && rangeInfo.m_rangeLsb == 0 && rangeInfo.m_rangeMsb == releasedVarp->width() - 1;
+        const bool fullBitwiseRelease = ForceState::isBitwiseDType(releasedVarp) && !selp
+                                        && rangeInfo.m_rangeLsb == 0
+                                        && rangeInfo.m_rangeMsb == releasedVarp->width() - 1;
         if (!releasedVarp->isContinuously()
             && !(m_state.doingAssign() && m_state.hasClockedWrite(releasedVarp)
                  && fullBitwiseRelease)) {
@@ -1299,15 +1357,23 @@ class ForceConvertVisitor final : public VNVisitor {
             // if (!continuously_driven) lhs = force_read_current(lhs_path);
             // forceVec.release(range);
             const bool hasOpaquePath = !ForceState::isBitwiseDType(releasedVarp)
-                                       && !rangeInfo.m_hasArraySel && !VN_IS(lhsp, VarRef);
+                                       && !rangeInfo.m_inForceVecOnly && !VN_IS(lhsp, VarRef);
             AstNodeExpr* forceReadp = nullptr;
-            if (hasOpaquePath) {
+            AstNodeExpr* assignLhsp = lhsp->cloneTreePure(false);
+            if (rangeInfo.m_inForceVecOnly && ForceState::isUnpackedArrayDType(lhsp->dtypep())) {
+                // Restore the whole array, slice or not: an element still forced reads back
+                // its forced value, as it will again when it is released.
+                forceReadp = varInfop->m_forceRdVscp
+                                 ? m_state.createForceRdExpression(*varInfop, flp)
+                                 : m_state.createForceReadExpression(*varInfop, lhsVarRefp);
+                VL_DO_DANGLING(assignLhsp->deleteTree(), assignLhsp);
+                assignLhsp = new AstVarRef{flp, lhsVarRefp->varScopep(), VAccess::WRITE};
+            } else if (hasOpaquePath) {
                 forceReadp = m_state.createForceReadIndexExpression(
                     *varInfop, lhsp, ForceState::makeConst32(flp, rangeInfo.m_rangeLsb));
-            } else if (rangeInfo.m_hasArraySel) {
+            } else if (rangeInfo.m_inForceVecOnly) {
                 forceReadp = m_state.createForceReadIndexExpression(
-                    *varInfop, basep,
-                    ForceState::buildFlattenIndexExpr(flp, rangeInfo.m_arrayInfo));
+                    *varInfop, basep, ForceState::makeConst32(flp, rangeInfo.m_rangeLsb));
                 if (selp) { forceReadp = ForceState::rebuildSelPath(lhsp, forceReadp); }
             } else if (selp && releasedVarp->isWide() && !varInfop->m_forceRdVscp) {
                 // Read back only the released bits
@@ -1324,7 +1390,7 @@ class ForceConvertVisitor final : public VNVisitor {
                                  lhsp, m_state.createForceReadExpression(*varInfop, lhsVarRefp))
                            : m_state.createForceReadExpression(*varInfop, lhsVarRefp);
             }
-            AstAssign* const assignp = new AstAssign{flp, lhsp->cloneTreePure(false), forceReadp};
+            AstAssign* const assignp = new AstAssign{flp, assignLhsp, forceReadp};
             assignp->addNextHere(stmtListp);
             stmtListp = assignp;
         }

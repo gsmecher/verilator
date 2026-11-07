@@ -1,0 +1,14 @@
+%Error-UNSUPPORTED: t/t_force_unpacked_slice_unsup.v:15:12: Unsupported: force/release of a slice of an unpacked array (IEEE 1800-2023 10.6.2)
+   15 |     force a[1:2] = src;
+      |            ^
+                    ... For error description see https://verilator.org/warn/UNSUPPORTED?v=latest
+%Error-UNSUPPORTED: t/t_force_unpacked_slice_unsup.v:17:15: Unsupported: force/release of a slice of an unpacked array (IEEE 1800-2023 10.6.2)
+   17 |     force b[1][0:1] = src;
+      |               ^
+%Error-UNSUPPORTED: t/t_force_unpacked_slice_unsup.v:16:14: Unsupported: force/release of a slice of an unpacked array (IEEE 1800-2023 10.6.2)
+   16 |     release a[1:2];
+      |              ^
+%Error-UNSUPPORTED: t/t_force_unpacked_slice_unsup.v:18:17: Unsupported: force/release of a slice of an unpacked array (IEEE 1800-2023 10.6.2)
+   18 |     release b[1][0:1];
+      |                 ^
+%Error: Exiting due to

@@ -222,8 +222,21 @@ class SliceVisitor final : public VNVisitor {
         VL_RESTORER(m_okConsArray);  // Set in assignOptimize
         m_assignError = false;
         m_assignp = nodep;
+        if (VN_IS(nodep, AssignForce)
+            && VN_IS(nodep->lhsp()->dtypep()->skipRefp(), UnpackArrayDType)) {
+            // V3Force forces a whole unpacked array, or a slice of one, as one element range
+            // of its force vector, and captures the RHS whole: leave the LHS path alone
+            m_okConsArray = true;
+            iterateAndNextNull(nodep->rhsp());
+            return;
+        }
         if (assignOptimize(nodep)) return;
         iterateChildren(nodep);
+    }
+
+    void visit(AstRelease* nodep) override {
+        // As for a force: V3Force releases the whole array or slice as one element range
+        if (!VN_IS(nodep->lhsp()->dtypep()->skipRefp(), UnpackArrayDType)) iterateChildren(nodep);
     }
 
     void visit(AstNodeCons* nodep) override {
