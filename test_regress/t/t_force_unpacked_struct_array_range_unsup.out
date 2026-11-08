@@ -1,0 +1,14 @@
+%Error-UNSUPPORTED: t/t_force_unpacked_struct_array_range_unsup.v:19:11: Unsupported: force/release of more than one element of an unpacked array of structs or unions with unpacked array members
+   19 |     force arr = '{default: f};
+      |           ^~~
+                    ... For error description see https://verilator.org/warn/UNSUPPORTED?v=latest
+%Error-UNSUPPORTED: t/t_force_unpacked_struct_array_range_unsup.v:21:18: Unsupported: force/release of more than one element of an unpacked array of structs or unions with unpacked array members
+   21 |     force arr[1].inner = '{4'ha, 4'hb, 4'hc};
+      |                  ^~~~~
+%Error-UNSUPPORTED: t/t_force_unpacked_struct_array_range_unsup.v:20:13: Unsupported: force/release of more than one element of an unpacked array of structs or unions with unpacked array members
+   20 |     release arr;
+      |             ^~~
+%Error-UNSUPPORTED: t/t_force_unpacked_struct_array_range_unsup.v:22:20: Unsupported: force/release of more than one element of an unpacked array of structs or unions with unpacked array members
+   22 |     release arr[1].inner;
+      |                    ^~~~~
+%Error: Exiting due to
