@@ -215,15 +215,18 @@ public:
         if (!pinp->exprp()) {
             // No-connect, perhaps promote based on `unconnected_drive,
             // otherwise done
+            // Sized to the port, as this is after V3Width
+            V3Number num{pinp, pinVarp->width()};
             if (pinVarp->direction() == VDirection::INPUT
                 && cellp->modp()->unconnectedDrive().isSetTrue()) {
-                pinp->exprp(new AstConst{pinp->fileline(), AstConst::All1{}});
+                num.setAllBits1();
             } else if (pinVarp->direction() == VDirection::INPUT
                        && cellp->modp()->unconnectedDrive().isSetFalse()) {
-                pinp->exprp(new AstConst{pinp->fileline(), AstConst::All0{}});
+                num.setAllBits0();
             } else {
                 return nullptr;
             }
+            pinp->exprp(new AstConst{pinp->fileline(), num});
         }
         const AstVarRef* const connectRefp = VN_CAST(pinp->exprp(), VarRef);
         const AstVarXRef* const connectXRefp = VN_CAST(pinp->exprp(), VarXRef);
